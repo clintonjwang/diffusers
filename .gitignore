@@ -1,4 +1,11 @@
 # Initially taken from Github's Python gitignore file
+*.png
+scratchpad.ipynb
+scripts/
+output/
+out/
+eg_photos/
+cls_dir/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
