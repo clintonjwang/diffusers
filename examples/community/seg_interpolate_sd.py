@@ -14,7 +14,8 @@ from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionS
 from diffusers.schedulers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler
 from diffusers.utils import deprecate, logging
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
-
+from transformers import MaskFormerFeatureExtractor, MaskFormerForInstanceSegmentation
+from torchvision import transforms
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -49,8 +50,10 @@ def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
 class StableDiffusionWalkPipeline(DiffusionPipeline):
     r"""
     Pipeline for text-to-image generation using Stable Diffusion.
+
     This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods the
     library implements for all the pipelines (such as downloading or saving, running on a particular device, etc.)
+
     Args:
         vae ([`AutoencoderKL`]):
             Variational Auto-Encoder (VAE) Model to encode and decode images to and from latent representations.
@@ -118,11 +121,24 @@ class StableDiffusionWalkPipeline(DiffusionPipeline):
             feature_extractor=feature_extractor,
         )
 
+    def init_segmenter(self, segmenter, seg_feature_extractor):
+        self.register_modules(
+            seg_feature_extractor=seg_feature_extractor,
+            segmenter=segmenter,
+        )
+        self.normalize = transforms.Normalize(mean=seg_feature_extractor.image_mean, std=seg_feature_extractor.image_std)
+        for param in self.segmenter.parameters():
+            param.requires_grad = False
+        for param in self.seg_feature_extractor.parameters():
+            param.requires_grad = False
+
     def enable_attention_slicing(self, slice_size: Optional[Union[str, int]] = "auto"):
         r"""
         Enable sliced attention computation.
+
         When this option is enabled, the attention module will split the input tensor in slices, to compute attention
         in several steps. This is useful to save some memory in exchange for a small speed decrease.
+
         Args:
             slice_size (`str` or `int`, *optional*, defaults to `"auto"`):
                 When `"auto"`, halves the input to the attention heads, so attention will be computed in two steps. If
@@ -151,6 +167,7 @@ class StableDiffusionWalkPipeline(DiffusionPipeline):
         width: int = 512,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
+        segmentation_scale: float = 0,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
@@ -165,6 +182,7 @@ class StableDiffusionWalkPipeline(DiffusionPipeline):
     ):
         r"""
         Function invoked when calling the pipeline for generation.
+
         Args:
             prompt (`str` or `List[str]`, *optional*, defaults to `None`):
                 The prompt or prompts to guide the image generation. If not provided, `text_embeddings` is required.
@@ -212,6 +230,7 @@ class StableDiffusionWalkPipeline(DiffusionPipeline):
                 Pre-generated text embeddings to be used as inputs for image generation. Can be used in place of
                 `prompt` to avoid re-computing the embeddings. If not provided, the embeddings will be generated from
                 the supplied `prompt`.
+
         Returns:
             [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
             [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] if `return_dict` is True, otherwise a `tuple.
@@ -268,6 +287,7 @@ class StableDiffusionWalkPipeline(DiffusionPipeline):
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
+        do_segmentation_consistency = segmentation_scale > 0
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance:
             uncond_tokens: List[str]
@@ -361,6 +381,20 @@ class StableDiffusionWalkPipeline(DiffusionPipeline):
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
+            if do_segmentation_consistency:
+                text_embeddings_for_guidance = (
+                    text_embeddings.chunk(2)[1] if do_classifier_free_guidance else text_embeddings
+                )
+                noise_pred, latents = self.cond_fn(
+                    latents,
+                    t,
+                    i,
+                    text_embeddings_for_guidance,
+                    noise_pred,
+                    text_embeddings_clip,
+                    clip_guidance_scale,
+                )
+
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
@@ -432,6 +466,7 @@ class StableDiffusionWalkPipeline(DiffusionPipeline):
     ) -> List[str]:
         """
         Walks through a series of prompts and seeds, interpolating between them and saving the results to disk.
+
         Args:
             prompts (`List[str]`):
                 List of prompts to generate images for.
@@ -462,6 +497,7 @@ class StableDiffusionWalkPipeline(DiffusionPipeline):
             eta (`float`, *optional*, defaults to 0.0):
                 Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
                 [`schedulers.DDIMScheduler`], will be ignored for others.
+
         Returns:
             `List[str]`: List of paths to the generated images.
         """
@@ -514,3 +550,13 @@ class StableDiffusionWalkPipeline(DiffusionPipeline):
                         frame_filepaths.append(frame_filepath)
                         frame_idx += 1
         return frame_filepaths
+
+    inputs = seg_feature_extractor(images=image, return_tensors="pt")
+    outputs = segmenter(**inputs)
+    # model predicts class_queries_logits of shape `(batch_size, num_queries)`
+    # and masks_queries_logits of shape `(batch_size, num_queries, height, width)`
+    class_queries_logits = outputs.class_queries_logits
+    masks_queries_logits = outputs.masks_queries_logits
+    # you can pass them to feature_extractor for postprocessing
+    # we refer to the demo notebooks for visualization (see "Resources" section in the MaskFormer docs)
+    predicted_semantic_map = feature_extractor.post_process_semantic_segmentation(outputs, target_sizes=[image.size[::-1]])[0]

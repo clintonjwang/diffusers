@@ -2,10 +2,12 @@
 *.png
 scratchpad.ipynb
 scripts/
-output/
-out/
+out*/
 eg_photos/
 cls_dir/
+*.txt
+*.mp4
+flagged/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
