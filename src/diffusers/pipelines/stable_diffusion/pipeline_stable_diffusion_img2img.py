@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import pdb
 from typing import Callable, List, Optional, Union
 
 import numpy as np
@@ -606,7 +607,8 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
 
                 # predict the noise residual
                 noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
-
+                pdb.set_trace()
+                
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)

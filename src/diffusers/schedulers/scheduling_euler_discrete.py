@@ -265,7 +265,7 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         else:
             self.timesteps = self.timesteps.to(original_samples.device)
             timesteps = timesteps.to(original_samples.device)
-
+        
         schedule_timesteps = self.timesteps
         step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
 

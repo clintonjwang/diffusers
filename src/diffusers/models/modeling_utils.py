@@ -57,6 +57,7 @@ if is_accelerate_available():
 
 if is_safetensors_available():
     import safetensors
+    import safetensors.torch
 
 
 def get_parameter_device(parameter: torch.nn.Module):
