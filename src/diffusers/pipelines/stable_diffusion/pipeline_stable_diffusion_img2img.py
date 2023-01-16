@@ -607,7 +607,6 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
 
                 # predict the noise residual
                 noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
-                pdb.set_trace()
                 
                 # perform guidance
                 if do_classifier_free_guidance:

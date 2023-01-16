@@ -1,8 +1,10 @@
-# bk2_blending with CFG
+# Blends real images by interpolating intermediate latents at various timesteps.
+# The midpoint is interpolated at the largest timestep, the quartiles are interpolated
+# using the real latents (with noise at the appropriate level) and the diffused midpoint
+# after a few timesteps, and so on. Similar to lunarring's LatentBlending scheme.
 
 import inspect
 import pdb, os
-import shutil
 from typing import Callable, List, Optional, Union
 
 import numpy as np
@@ -37,157 +39,31 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import Stabl
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
-@torch.no_grad()
-def interpolate_spherical(p0, p1, fract_mixing: float):
-    r""" Copied from lunarring/latentblending
-    Helper function to correctly mix two random variables using spherical interpolation.
-    See https://en.wikipedia.org/wiki/Slerp
-    The function will always cast up to float64 for sake of extra 4.
-    Args:
-        p0: 
-            First tensor for interpolation
-        p1: 
-            Second tensor for interpolation
-        fract_mixing: float 
-            Mixing coefficient of interval [0, 1]. 
-            0 will return in p0
-            1 will return in p1
-            0.x will return a mix between both preserving angular velocity.
-    """ 
-    
-    if p0.dtype == torch.float16:
-        recast_to = 'fp16'
+def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
+    """helper function to spherically interpolate two arrays v1 v2"""
+
+    if not isinstance(v0, np.ndarray):
+        inputs_are_torch = True
+        input_device = v0.device
+        v0 = v0.cpu().numpy()
+        v1 = v1.cpu().numpy()
+
+    dot = np.sum(v0 * v1 / (np.linalg.norm(v0) * np.linalg.norm(v1)))
+    if np.abs(dot) > DOT_THRESHOLD:
+        v2 = (1 - t) * v0 + t * v1
     else:
-        recast_to = 'fp32'
-    
-    p0 = p0.double()
-    p1 = p1.double()
-    norm = torch.linalg.norm(p0) * torch.linalg.norm(p1)
-    epsilon = 1e-7
-    dot = torch.sum(p0 * p1) / norm
-    dot = dot.clamp(-1+epsilon, 1-epsilon)
-    
-    theta_0 = torch.arccos(dot)
-    sin_theta_0 = torch.sin(theta_0)
-    theta_t = theta_0 * fract_mixing
-    s0 = torch.sin(theta_0 - theta_t) / sin_theta_0
-    s1 = torch.sin(theta_t) / sin_theta_0
-    interp = p0*s0 + p1*s1
-    
-    if recast_to == 'fp16':
-        interp = interp.half()
-    elif recast_to == 'fp32':
-        interp = interp.float()
-        
-    return interp
+        theta_0 = np.arccos(dot)
+        sin_theta_0 = np.sin(theta_0)
+        theta_t = theta_0 * t
+        sin_theta_t = np.sin(theta_t)
+        s0 = np.sin(theta_0 - theta_t) / sin_theta_0
+        s1 = sin_theta_t / sin_theta_0
+        v2 = s0 * v0 + s1 * v1
 
-def interpolate_linear(p0, p1, fract_mixing):
-    r"""
-    Helper function to mix two variables using standard linear interpolation.
-    Args:
-        p0: 
-            First tensor / np.ndarray for interpolation
-        p1: 
-            Second tensor / np.ndarray  for interpolation
-        fract_mixing: float 
-            Mixing coefficient of interval [0, 1]. 
-            0 will return in p0
-            1 will return in p1
-            0.x will return a linear mix between both.
-    """ 
-    reconvert_uint8 = False
-    if type(p0) is np.ndarray and p0.dtype == 'uint8':
-        reconvert_uint8 = True
-        p0 = p0.astype(np.float64)
-        
-    if type(p1) is np.ndarray and p1.dtype == 'uint8':
-        reconvert_uint8 = True
-        p1 = p1.astype(np.float64)
-    
-    interp = (1-fract_mixing) * p0 + fract_mixing * p1
-    
-    if reconvert_uint8:
-        interp = np.clip(interp, 0, 255).astype(np.uint8)
-        
-    return interp
+    if inputs_are_torch:
+        v2 = torch.from_numpy(v2).to(input_device)
 
-
-def add_frames_linear_interp(
-        list_imgs: List[np.ndarray], 
-        fps_target: Union[float, int] = None, 
-        duration_target: Union[float, int] = None,
-        nmb_frames_target: int=None,
-    ):
-    r"""
-    Helper function to cheaply increase the number of frames given a list of images, 
-    by virtue of standard linear interpolation.
-    The number of inserted frames will be automatically adjusted so that the total of number
-    of frames can be fixed precisely, using a random shuffling technique.
-    The function allows 1:1 comparisons between transitions as videos.
-    
-    Args:
-        list_imgs: List[np.ndarray)
-            List of images, between each image new frames will be inserted via linear interpolation.
-        fps_target: 
-            OptionA: specify here the desired frames per second.
-        duration_target: 
-            OptionA: specify here the desired duration of the transition in seconds.
-        nmb_frames_target: 
-            OptionB: directly fix the total number of frames of the output.
-    """ 
-    
-    # Sanity
-    if nmb_frames_target is not None and fps_target is not None:
-        raise ValueError("You cannot specify both fps_target and nmb_frames_target")
-    if fps_target is None:
-        assert nmb_frames_target is not None, "Either specify nmb_frames_target or nmb_frames_target"
-    if nmb_frames_target is None:
-        assert fps_target is not None, "Either specify duration_target and fps_target OR nmb_frames_target"
-        assert duration_target is not None, "Either specify duration_target and fps_target OR nmb_frames_target"
-        nmb_frames_target = fps_target*duration_target
-    
-    # Get number of frames that are missing
-    nmb_frames_diff = len(list_imgs)-1
-    nmb_frames_missing = nmb_frames_target - nmb_frames_diff - 1
-    
-    if nmb_frames_missing < 1:
-        return list_imgs
-    
-    list_imgs_float = [img.astype(np.float32) for img in list_imgs]
-    
-    # Distribute missing frames, append nmb_frames_to_insert(i) frames for each frame
-    mean_nmb_frames_insert = nmb_frames_missing/nmb_frames_diff
-    constfact = np.floor(mean_nmb_frames_insert)
-    remainder_x = 1-(mean_nmb_frames_insert - constfact)
-    
-    nmb_iter = 0
-    while True:
-        nmb_frames_to_insert = np.random.rand(nmb_frames_diff)
-        nmb_frames_to_insert[nmb_frames_to_insert<=remainder_x] = 0
-        nmb_frames_to_insert[nmb_frames_to_insert>remainder_x] = 1
-        nmb_frames_to_insert += constfact
-        if np.sum(nmb_frames_to_insert) == nmb_frames_missing:
-            break
-        nmb_iter += 1
-        if nmb_iter > 100000:
-            print("issue with inserting the right number of frames")
-            break
-        
-    nmb_frames_to_insert = nmb_frames_to_insert.astype(np.int32)
-    list_imgs_interp = []
-    for i in range(len(list_imgs_float)-1):#, desc="STAGE linear interp"):
-        img0 = list_imgs_float[i]
-        img1 = list_imgs_float[i+1]
-        list_imgs_interp.append(img0.astype(np.uint8))
-        list_fracts_linblend = np.linspace(0, 1, nmb_frames_to_insert[i]+2)[1:-1]
-        for fract_linblend in list_fracts_linblend:
-            img_blend = interpolate_linear(img0, img1, fract_linblend).astype(np.uint8)
-            list_imgs_interp.append(img_blend.astype(np.uint8))
-        
-        if i==len(list_imgs_float)-2:
-            list_imgs_interp.append(img1.astype(np.uint8))
-    
-    return list_imgs_interp
+    return v2
 
 
 
@@ -336,53 +212,50 @@ class BlendingPipeline(DiffusionPipeline):
             )
 
         image = image.to(device=device, dtype=dtype)
-        init_latents = self.vae.encode(image).latent_dist.sample(generator).double()
+        init_latents = self.vae.encode(image).latent_dist.sample(generator)
         latents = [0.18215 * torch.cat([init_latents], dim=0)]
         shape = latents[-1].shape
         t_prev = None
-        sch = self.scheduler
-        # sch.betas *= 1-self.strength
-        # sch.alphas = 1.0 - sch.betas
-        # sch.alphas_cumprod = torch.cumprod(sch.alphas, dim=0)
-        # sch.final_alpha_cumprod = sch.alphas_cumprod[0]
-        sch.alphas_cumprod = sch.alphas_cumprod.to(
-            device=init_latents.device, dtype=init_latents.dtype)
         for t_now in timesteps[::self.steps_per_frame].flip(0):
-            noise = randn_tensor(shape, generator=generator, device=device, dtype=torch.double)#dtype)
+            noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
             latents.append(self.add_more_noise(latents[-1], noise, t_now, t_prev))
             t_prev = t_now
-        sch.alphas_cumprod = sch.alphas_cumprod.to(dtype=dtype)
-        return [l.to(dtype=dtype) for l in latents]
+        return latents
 
     def add_more_noise(self, latents, noise, t2, t1=None):
-        sch = self.scheduler
         if t1 is None:
-            return sch.add_noise(latents, noise, t2)
+            return self.scheduler.add_noise(latents, noise, t2)
 
+        sch = self.scheduler
         if not (isinstance(sch, DDIMScheduler) or isinstance(sch, PNDMScheduler)):
             raise NotImplementedError
 
+        sch.alphas_cumprod = sch.alphas_cumprod.to(device=latents.device, dtype=latents.dtype)
         t1 = t1.to(latents.device)
         t2 = t2.to(latents.device)
 
         a1 = sch.alphas_cumprod[t1] ** 0.5
+        a1 = a1.flatten()
         while len(a1.shape) < len(latents.shape):
             a1 = a1.unsqueeze(-1)
 
-        var1 = 1 - sch.alphas_cumprod[t1]
-        while len(var1.shape) < len(latents.shape):
-            var1 = var1.unsqueeze(-1)
+        sig1 = (1 - sch.alphas_cumprod[t1]) ** 0.5
+        sig1 = sig1.flatten()
+        while len(sig1.shape) < len(latents.shape):
+            sig1 = sig1.unsqueeze(-1)
 
         a2 = sch.alphas_cumprod[t2] ** 0.5
+        a2 = a2.flatten()
         while len(a2.shape) < len(latents.shape):
             a2 = a2.unsqueeze(-1)
 
         var2 = 1 - sch.alphas_cumprod[t2]
+        var2 = var2.flatten()
         while len(var2.shape) < len(latents.shape):
             var2 = var2.unsqueeze(-1)
 
         scale = a2/a1
-        sigma = (var2 - scale**2 * var1).sqrt()
+        sigma = (var2 - (scale*sig1)**2).sqrt()
         return scale * latents + sigma * noise
 
     @torch.no_grad()
@@ -391,20 +264,15 @@ class BlendingPipeline(DiffusionPipeline):
         image1: Union[torch.FloatTensor, PIL.Image.Image] = None,
         image2: Union[torch.FloatTensor, PIL.Image.Image] = None,
         prompt: Optional[str] = "",
-        strength: Optional[float] = 0.7,
         num_inference_steps: Optional[int] = 50,
-        guidance_scale: Optional[float] = 7.5,
-        negative_prompt: Optional[Union[str, List[str]]] = None,
         eta: Optional[float] = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         output_dir: Optional[str] = None,
         steps_per_frame: Optional[int] = 16,
     ):
-        self.strength = strength
         device = self._execution_device
-        do_classifier_free_guidance = guidance_scale > 1.0
         text_embeddings = self._encode_prompt(
-            prompt, device, do_classifier_free_guidance, negative_prompt
+            prompt, device,
         )
         self.steps_per_frame = steps_per_frame
         if output_dir is None:
@@ -417,12 +285,10 @@ class BlendingPipeline(DiffusionPipeline):
         image2 = preprocess(image2)
 
         # 5. set timesteps
-        sch = self.scheduler
-        sch.set_timesteps(num_inference_steps, device=device)
-        sch.timesteps = sch.timesteps[int(len(sch.timesteps)*(1-self.strength)):]
-        if (t := len(sch.timesteps) % self.steps_per_frame) != 0:
-            sch.timesteps = sch.timesteps[t:]
-        timesteps = sch.timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        if (t := len(self.scheduler.timesteps) % self.steps_per_frame) != 0:
+            self.scheduler.timesteps = self.scheduler.timesteps[t:]
+        timesteps = self.scheduler.timesteps
         F = len(timesteps)*2 + 1
 
         # 6. Prepare latent variables
@@ -445,44 +311,44 @@ class BlendingPipeline(DiffusionPipeline):
         with self.progress_bar(total=N) as progress_bar:
             for i, t in enumerate(timesteps):
                 for frame_ix in range(step, total_frames-1, step): # exclude endpoints
-                    latent_model_input = torch.cat([latents[frame_ix]] * 2) if do_classifier_free_guidance else latents[frame_ix]
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    latent_model_input = self.scheduler.scale_model_input(latents[frame_ix], t)
 
                     # predict the noise residual
                     with torch.autocast('cuda'):
-                        noise_pred = self.unet(latent_model_input, t,
-                            encoder_hidden_states=text_embeddings).sample
-
-                    # perform guidance
-                    if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
 
                     # compute the previous noisy sample x_t -> x_t-1
                     latents[frame_ix] = self.scheduler.step(noise_pred, t, latents[frame_ix], **extra_step_kwargs).prev_sample
                     progress_bar.update()
                 
                 if i % self.steps_per_frame == 0:
-                    latents[0] = latents1[-i//self.steps_per_frame-1]
-                    latents[-1] = latents2[-i//self.steps_per_frame-1]
+                    latents[0] = latents1[-i//self.steps_per_frame]
+                    latents[-1] = latents2[-i//self.steps_per_frame]
                     step //= 2
                     for frame_ix in range(step, total_frames-1, step*2):
                         assert latents[frame_ix] is None
-                        latents[frame_ix] = interpolate_spherical(latents[frame_ix-step], latents[frame_ix+step], .5)
+                        latents[frame_ix] = slerp(.5, latents[frame_ix-step], latents[frame_ix+step])
 
         latents[0] = latents1[0]
         latents[-1] = latents2[0]
 
         with torch.autocast('cuda'):
-            list_imgs = [self.decode_latents(latents[i]) for i in range(len(latents))]
-        # list_imgs = add_frames_linear_interp(list_imgs, nmb_frames_target = len(list_imgs)*2-1)
-        for i,image in enumerate(list_imgs):
-            self.numpy_to_pil(image)[0].save(os.path.join(output_dir, f'{i:03d}.png'))
+            for i in range(len(latents)):
+                image = self.decode_latents(latents[i])
+                image = self.numpy_to_pil(image)
+                image[0].save(os.path.join(output_dir, f'{i}.png'))
 
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline._encode_prompt
-    def _encode_prompt(self, prompt, device, do_classifier_free_guidance, negative_prompt):
-        r"""Encodes the prompt into text encoder hidden states.
+    def _encode_prompt(self, prompt, device):
+        r"""
+        Encodes the prompt into text encoder hidden states.
+
+        Args:
+            prompt (`str` or `list(int)`):
+                prompt to be encoded
+            device: (`torch.device`):
+                torch device
         """
         text_inputs = self.tokenizer(
             prompt,
@@ -492,6 +358,14 @@ class BlendingPipeline(DiffusionPipeline):
             return_tensors="pt",
         )
         text_input_ids = text_inputs.input_ids
+        untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+            removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1])
+            logger.warning(
+                "The following part of your input was truncated because CLIP can only handle sequences up to"
+                f" {self.tokenizer.model_max_length} tokens: {removed_text}"
+            )
 
         if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
             attention_mask = text_inputs.attention_mask.to(device)
@@ -507,46 +381,8 @@ class BlendingPipeline(DiffusionPipeline):
 
         # duplicate text embeddings for each generation per prompt, using mps friendly method
         bs_embed, seq_len, _ = text_embeddings.shape
+        text_embeddings = text_embeddings.repeat(1, 1, 1)
         text_embeddings = text_embeddings.view(bs_embed, seq_len, -1)
-
-        # get unconditional embeddings for classifier free guidance
-        if do_classifier_free_guidance:
-            uncond_tokens: List[str]
-            if negative_prompt is None:
-                uncond_tokens = [""]
-            elif isinstance(negative_prompt, str):
-                uncond_tokens = [negative_prompt]
-            else:
-                uncond_tokens = negative_prompt
-
-            max_length = text_input_ids.shape[-1]
-            uncond_input = self.tokenizer(
-                uncond_tokens,
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-
-            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
-                attention_mask = uncond_input.attention_mask.to(device)
-            else:
-                attention_mask = None
-
-            uncond_embeddings = self.text_encoder(
-                uncond_input.input_ids.to(device),
-                attention_mask=attention_mask,
-            )
-            uncond_embeddings = uncond_embeddings[0]
-
-            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
-            seq_len = uncond_embeddings.shape[1]
-            uncond_embeddings = uncond_embeddings.view(1, seq_len, -1)
-
-            # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and text embeddings into a single batch
-            # to avoid doing two forward passes
-            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
 
         return text_embeddings
 
@@ -562,38 +398,10 @@ if __name__ == "__main__":
 
     image1 = Image.open(expanduser('00.png'))
     image2 = Image.open(expanduser('01.png'))
-    folder = "./out"
-    shutil.rmtree(folder, ignore_errors=True)
     frame_filepaths = pipe(
         image1,
         image2,
-        prompt="""a yellow cartoon caterpillar with a flower on its head, 
-wiggler from super mario 64, worm, 3D, detailed, beautiful""",
+        prompt="wiggler from super mario bros, cartoon, ultra-detailed",
         num_inference_steps=100,
-        strength=0.7,
-        steps_per_frame=15,
-        guidance_scale=4,
-        negative_prompt="blurry, photograph, text, mario, ugly",
-        output_dir=folder,
+        output_dir="./out",
     )
-
-    import subprocess, glob
-    folder = "./out"
-    cmd = [
-        'ffmpeg',
-        '-y',
-        '-vcodec', 'png',
-        '-r', '40',
-        '-start_number', '0',
-        '-i', f'{folder}/%03d.png',
-        '-frames:v', str(len(glob.glob(f'./{folder}/*.png'))),
-        '-c:v', 'libx264',
-        '-vf', 'fps=40',
-        '-pix_fmt', 'yuv420p',
-        '-crf', '17',
-        '-preset', 'veryfast',
-        '-pattern_type', 'sequence',
-        './wiggler.mp4',
-    ]
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    stdout, stderr = process.communicate()
