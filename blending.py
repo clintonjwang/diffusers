@@ -328,39 +328,39 @@ class BlendingPipeline(DiffusionPipeline):
             extra_step_kwargs["generator"] = generator
         return extra_step_kwargs
 
-    def get_latents(self, image, timesteps, dtype, device, generator=None):
+    def get_latents(self, image1, image2, timesteps, dtype, device, generator=None):
         """Returns a stack of latents at all timesteps"""
-        if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
-            raise ValueError(
-                f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
-            )
 
-        image = image.to(device=device, dtype=dtype)
-        init_latents = self.vae.encode(image).latent_dist.sample(generator).double()
-        latents = [0.18215 * torch.cat([init_latents], dim=0)]
-        shape = latents[-1].shape
+        image1 = image1.to(device=device, dtype=dtype)
+        image2 = image2.to(device=device, dtype=dtype)
+        init_latents1 = self.vae.encode(image1).latent_dist.sample(generator).double()
+        init_latents2 = self.vae.encode(image2).latent_dist.sample(generator).double()
+        latents1 = [0.18215 * torch.cat([init_latents1], dim=0)]
+        latents2 = [0.18215 * torch.cat([init_latents2], dim=0)]
+        shape = latents1[-1].shape
         t_prev = None
         sch = self.scheduler
+        if not (isinstance(sch, DDIMScheduler) or isinstance(sch, PNDMScheduler)):
+            raise NotImplementedError
+
         # sch.betas *= 1-self.strength
         # sch.alphas = 1.0 - sch.betas
         # sch.alphas_cumprod = torch.cumprod(sch.alphas, dim=0)
         # sch.final_alpha_cumprod = sch.alphas_cumprod[0]
         sch.alphas_cumprod = sch.alphas_cumprod.to(
-            device=init_latents.device, dtype=init_latents.dtype)
+            device=init_latents1.device, dtype=init_latents1.dtype)
         for t_now in timesteps[::self.steps_per_frame].flip(0):
             noise = randn_tensor(shape, generator=generator, device=device, dtype=torch.double)#dtype)
-            latents.append(self.add_more_noise(latents[-1], noise, t_now, t_prev))
+            latents1.append(self.add_more_noise(latents1[-1], noise, t_now, t_prev))
+            latents2.append(self.add_more_noise(latents2[-1], noise, t_now, t_prev))
             t_prev = t_now
         sch.alphas_cumprod = sch.alphas_cumprod.to(dtype=dtype)
-        return [l.to(dtype=dtype) for l in latents]
+        return [l.to(dtype=dtype) for l in latents1], [l.to(dtype=dtype) for l in latents2]
 
     def add_more_noise(self, latents, noise, t2, t1=None):
         sch = self.scheduler
         if t1 is None:
             return sch.add_noise(latents, noise, t2)
-
-        if not (isinstance(sch, DDIMScheduler) or isinstance(sch, PNDMScheduler)):
-            raise NotImplementedError
 
         t1 = t1.to(latents.device)
         t2 = t2.to(latents.device)
@@ -419,7 +419,7 @@ class BlendingPipeline(DiffusionPipeline):
         # 5. set timesteps
         sch = self.scheduler
         sch.set_timesteps(num_inference_steps, device=device)
-        sch.timesteps = sch.timesteps[int(len(sch.timesteps)*(1-self.strength)):]
+        sch.timesteps = sch.timesteps[int(len(sch.timesteps)*self.strength):]
         if (t := len(sch.timesteps) % self.steps_per_frame) != 0:
             sch.timesteps = sch.timesteps[t:]
         timesteps = sch.timesteps
@@ -427,11 +427,8 @@ class BlendingPipeline(DiffusionPipeline):
 
         # 6. Prepare latent variables
         with torch.autocast('cuda'):
-            latents1 = self.get_latents(
-                image1, timesteps, dtype, device, generator
-            )
-            latents2 = self.get_latents(
-                image2, timesteps, dtype, device, generator
+            latents1, latents2 = self.get_latents(
+                image1, image2, timesteps, dtype, device, generator
             )
         
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -444,6 +441,28 @@ class BlendingPipeline(DiffusionPipeline):
         N = self.steps_per_frame * sum([2**x-1 for x in range(1, T//self.steps_per_frame+1)])
         with self.progress_bar(total=N) as progress_bar:
             for i, t in enumerate(timesteps):
+                if i % self.steps_per_frame == 0:
+                    latents[0] = latents1[-i//self.steps_per_frame-1]
+                    latents[-1] = latents2[-i//self.steps_per_frame-1]
+                    step //= 2
+
+                    if i // self.steps_per_frame == 2:
+                        latents[total_frames // 2] = interpolate_spherical(
+                            latents[total_frames // 4], latents[3 * total_frames // 4], .5)
+                    # elif i // self.steps_per_frame == 3:
+                    #     latents[total_frames // 2] = interpolate_spherical(
+                    #         latents[3 * total_frames // 8], latents[5 * total_frames // 8], .5)
+
+                    for frame_ix in range(step, total_frames-1, step*2):
+                        assert latents[frame_ix] is None
+                        frac = .5
+                        if frame_ix-step == 0:
+                            frac -= .25
+                        if frame_ix+step == total_frames-1:
+                            frac += .25
+                        latents[frame_ix] = interpolate_spherical(
+                            latents[frame_ix-step], latents[frame_ix+step], frac)
+
                 for frame_ix in range(step, total_frames-1, step): # exclude endpoints
                     latent_model_input = torch.cat([latents[frame_ix]] * 2) if do_classifier_free_guidance else latents[frame_ix]
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
@@ -462,13 +481,6 @@ class BlendingPipeline(DiffusionPipeline):
                     latents[frame_ix] = self.scheduler.step(noise_pred, t, latents[frame_ix], **extra_step_kwargs).prev_sample
                     progress_bar.update()
                 
-                if i % self.steps_per_frame == 0:
-                    latents[0] = latents1[-i//self.steps_per_frame-1]
-                    latents[-1] = latents2[-i//self.steps_per_frame-1]
-                    step //= 2
-                    for frame_ix in range(step, total_frames-1, step*2):
-                        assert latents[frame_ix] is None
-                        latents[frame_ix] = interpolate_spherical(latents[frame_ix-step], latents[frame_ix+step], .5)
 
         latents[0] = latents1[0]
         latents[-1] = latents2[0]
@@ -560,40 +572,41 @@ if __name__ == "__main__":
     # pipe.enable_attention_slicing()
     from os.path import expanduser
 
-    image1 = Image.open(expanduser('00.png'))
-    image2 = Image.open(expanduser('01.png'))
-    folder = "./out"
+    image1 = Image.open(expanduser('04.png')).convert('RGB')
+    image2 = Image.open(expanduser('05.png')).convert('RGB')
+    folder = "./charmander"
     shutil.rmtree(folder, ignore_errors=True)
     frame_filepaths = pipe(
-        image1,
-        image2,
-        prompt="""a yellow cartoon caterpillar with a flower on its head, 
-wiggler from super mario 64, worm, 3D, detailed, beautiful""",
-        num_inference_steps=100,
-        strength=0.7,
-        steps_per_frame=15,
-        guidance_scale=4,
-        negative_prompt="blurry, photograph, text, mario, ugly",
+        image1, image2,
+        prompt="""a close up of a pokemon on a white background, 
+fire type, charmander, charmeleon, orange-red, large eyes, flame tail, 
+upright, by Ken Sugimori, has fire powers, 
+official splash art""",
+        num_inference_steps=70,
+        strength=0.,
+        steps_per_frame=12,
+        guidance_scale=7,
+        negative_prompt="blurry, photograph, text, lopsided, twisted",
         output_dir=folder,
     )
 
-    import subprocess, glob
-    folder = "./out"
-    cmd = [
-        'ffmpeg',
-        '-y',
-        '-vcodec', 'png',
-        '-r', '40',
-        '-start_number', '0',
-        '-i', f'{folder}/%03d.png',
-        '-frames:v', str(len(glob.glob(f'./{folder}/*.png'))),
-        '-c:v', 'libx264',
-        '-vf', 'fps=40',
-        '-pix_fmt', 'yuv420p',
-        '-crf', '17',
-        '-preset', 'veryfast',
-        '-pattern_type', 'sequence',
-        './wiggler.mp4',
-    ]
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    stdout, stderr = process.communicate()
+    # import subprocess, glob
+    # folder = "./out"
+    # cmd = [
+    #     'ffmpeg',
+    #     '-y',
+    #     '-vcodec', 'png',
+    #     '-r', '40',
+    #     '-start_number', '0',
+    #     '-i', f'{folder}/%03d.png',
+    #     '-frames:v', str(len(glob.glob(f'./{folder}/*.png'))),
+    #     '-c:v', 'libx264',
+    #     '-vf', 'fps=40',
+    #     '-pix_fmt', 'yuv420p',
+    #     '-crf', '17',
+    #     '-preset', 'veryfast',
+    #     '-pattern_type', 'sequence',
+    #     './gengar.mp4',
+    # ]
+    # process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # stdout, stderr = process.communicate()
