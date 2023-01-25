@@ -258,10 +258,11 @@ class StableDiffusionPipeline(DiffusionPipeline):
         else:
             attention_mask = None
 
-        text_embeddings = self.text_encoder(
-            text_input_ids.to(device),
-            attention_mask=attention_mask,
-        )
+        with torch.autocast('cuda'):
+            text_embeddings = self.text_encoder(
+                text_input_ids.to(device),
+                attention_mask=attention_mask,
+            )
         text_embeddings = text_embeddings[0]
 
         # duplicate text embeddings for each generation per prompt, using mps friendly method
@@ -304,10 +305,11 @@ class StableDiffusionPipeline(DiffusionPipeline):
             else:
                 attention_mask = None
 
-            uncond_embeddings = self.text_encoder(
-                uncond_input.input_ids.to(device),
-                attention_mask=attention_mask,
-            )
+            with torch.autocast('cuda'):
+                uncond_embeddings = self.text_encoder(
+                    uncond_input.input_ids.to(device),
+                    attention_mask=attention_mask,
+                )
             uncond_embeddings = uncond_embeddings[0]
 
             # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
@@ -482,7 +484,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         # 3. Encode input prompt
         text_embeddings = self._encode_prompt(
             prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt
-        )
+        ).half()
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)

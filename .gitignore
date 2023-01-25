@@ -8,6 +8,7 @@ cls_dir/
 *.txt
 *.mp4
 flagged/
+models/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -10,10 +10,8 @@ import torch
 
 import PIL
 from PIL import Image
-from packaging import version
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from diffusers.configuration_utils import FrozenDict
 from diffusers.models import AutoencoderKL, UNet2DConditionModel
 from diffusers.schedulers import (
     DDIMScheduler,
@@ -25,11 +23,9 @@ from diffusers.schedulers import (
 )
 from diffusers.utils import (
     PIL_INTERPOLATION,
-    deprecate,
     is_accelerate_available,
     logging,
     randn_tensor,
-    replace_example_docstring,
 )
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineOutput
@@ -209,7 +205,7 @@ def preprocess(image):
         image = torch.from_numpy(image)
     elif isinstance(image[0], torch.Tensor):
         image = torch.cat(image, dim=0)
-    return image
+    return image.half()
 
 
 class BlendingPipeline(DiffusionPipeline):
@@ -405,7 +401,7 @@ class BlendingPipeline(DiffusionPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
         text_embeddings = self._encode_prompt(
             prompt, device, do_classifier_free_guidance, negative_prompt
-        )
+        ).half()
         self.steps_per_frame = steps_per_frame
         if output_dir is None:
             output_dir = '.'
@@ -426,8 +422,7 @@ class BlendingPipeline(DiffusionPipeline):
         F = len(timesteps)*2 + 1
 
         # 6. Prepare latent variables
-        with torch.autocast('cuda'):
-            latents1, latents2 = self.get_latents(
+        latents1, latents2 = self.get_latents(
                 image1, image2, timesteps, dtype, device, generator
             )
         
@@ -468,8 +463,7 @@ class BlendingPipeline(DiffusionPipeline):
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                     # predict the noise residual
-                    with torch.autocast('cuda'):
-                        noise_pred = self.unet(latent_model_input, t,
+                    noise_pred = self.unet(latent_model_input, t,
                             encoder_hidden_states=text_embeddings).sample
 
                     # perform guidance
@@ -485,8 +479,7 @@ class BlendingPipeline(DiffusionPipeline):
         latents[0] = latents1[0]
         latents[-1] = latents2[0]
 
-        with torch.autocast('cuda'):
-            list_imgs = [self.decode_latents(latents[i]) for i in range(len(latents))]
+        list_imgs = [self.decode_latents(latents[i]) for i in range(len(latents))]
         # list_imgs = add_frames_linear_interp(list_imgs, nmb_frames_target = len(list_imgs)*2-1)
         for i,image in enumerate(list_imgs):
             self.numpy_to_pil(image)[0].save(os.path.join(output_dir, f'{i:03d}.png'))
@@ -545,10 +538,11 @@ class BlendingPipeline(DiffusionPipeline):
             else:
                 attention_mask = None
 
-            uncond_embeddings = self.text_encoder(
-                uncond_input.input_ids.to(device),
-                attention_mask=attention_mask,
-            )
+            with torch.autocast('cuda'):
+                uncond_embeddings = self.text_encoder(
+                    uncond_input.input_ids.to(device),
+                    attention_mask=attention_mask,
+                )
             uncond_embeddings = uncond_embeddings[0]
 
             # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
@@ -572,21 +566,18 @@ if __name__ == "__main__":
     # pipe.enable_attention_slicing()
     from os.path import expanduser
 
-    image1 = Image.open(expanduser('04.png')).convert('RGB')
-    image2 = Image.open(expanduser('05.png')).convert('RGB')
-    folder = "./charmander"
+    image1 = Image.open(expanduser('01.png')).convert('RGB').resize((768,768))
+    image2 = Image.open(expanduser('02.png')).convert('RGB').resize((768,768))
+    folder = "./fortune"
     shutil.rmtree(folder, ignore_errors=True)
     frame_filepaths = pipe(
         image1, image2,
-        prompt="""a close up of a pokemon on a white background, 
-fire type, charmander, charmeleon, orange-red, large eyes, flame tail, 
-upright, by Ken Sugimori, has fire powers, 
-official splash art""",
-        num_inference_steps=70,
+        prompt="fortune teller ball",
+        num_inference_steps=25,
         strength=0.,
-        steps_per_frame=12,
-        guidance_scale=7,
-        negative_prompt="blurry, photograph, text, lopsided, twisted",
+        steps_per_frame=10,
+        guidance_scale=4,
+        negative_prompt="blurry, text, bad anatomy, extra arms, extra fingers, poorly drawn hands, disfigured, tiling, deformed, mutated",
         output_dir=folder,
     )
 
