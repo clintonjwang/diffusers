@@ -552,6 +552,7 @@ def main(args):
 
             sample_dataloader = accelerator.prepare(sample_dataloader)
             pipeline.to(accelerator.device)
+            pipeline.enable_xformers_memory_efficient_attention()
 
             for example in tqdm(
                 sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process

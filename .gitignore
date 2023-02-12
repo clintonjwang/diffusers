@@ -2,9 +2,10 @@
 *.png
 scratchpad.ipynb
 scripts/
-out*/
-eg_photos/
+dreambooth/
+inst_dir/
 cls_dir/
+out*/
 *.txt
 *.mp4
 flagged/

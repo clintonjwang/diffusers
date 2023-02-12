@@ -1,9 +1,8 @@
-# bk2_blending with CFG
-
 import inspect
 import pdb, os
 import shutil
-from typing import Callable, List, Optional, Union
+from typing import List, Optional, Union
+from os.path import expanduser
 
 import numpy as np
 import torch
@@ -28,8 +27,6 @@ from diffusers.utils import (
     randn_tensor,
 )
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipelineOutput
-
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -387,7 +384,7 @@ class BlendingPipeline(DiffusionPipeline):
         image1: Union[torch.FloatTensor, PIL.Image.Image] = None,
         image2: Union[torch.FloatTensor, PIL.Image.Image] = None,
         prompt: Optional[str] = "",
-        strength: Optional[float] = 0.7,
+        strength: Optional[float] = 0,
         num_inference_steps: Optional[int] = 50,
         guidance_scale: Optional[float] = 7.5,
         negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -396,7 +393,7 @@ class BlendingPipeline(DiffusionPipeline):
         output_dir: Optional[str] = None,
         steps_per_frame: Optional[int] = 16,
     ):
-        self.strength = strength
+        self.strength = strength # doesn't work
         device = self._execution_device
         do_classifier_free_guidance = guidance_scale > 1.0
         text_embeddings = self._encode_prompt(
@@ -452,9 +449,9 @@ class BlendingPipeline(DiffusionPipeline):
                         assert latents[frame_ix] is None
                         frac = .5
                         if frame_ix-step == 0:
-                            frac -= .25
+                            frac -= .15
                         if frame_ix+step == total_frames-1:
-                            frac += .25
+                            frac += .15
                         latents[frame_ix] = interpolate_spherical(
                             latents[frame_ix-step], latents[frame_ix+step], frac)
 
@@ -559,28 +556,26 @@ class BlendingPipeline(DiffusionPipeline):
 
 if __name__ == "__main__":
     pipe = BlendingPipeline.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
-        # "stabilityai/stable-diffusion-2-1",
+        # "runwayml/stable-diffusion-v1-5",
+        "stabilityai/stable-diffusion-2-1",
         torch_dtype=torch.float16,
     ).to("cuda")
-    # pipe.enable_attention_slicing()
-    from os.path import expanduser
+    pipe.enable_xformers_memory_efficient_attention()
 
-    image1 = Image.open(expanduser('01.png')).convert('RGB').resize((768,768))
-    image2 = Image.open(expanduser('02.png')).convert('RGB').resize((768,768))
-    folder = "./fortune"
+    image1 = Image.open(expanduser('beach__.png')).convert('RGB').resize((1280,768))
+    image2 = Image.open(expanduser('bed_blur.png')).convert('RGB').resize((1280,768))
+    folder = "./blend"
     shutil.rmtree(folder, ignore_errors=True)
     frame_filepaths = pipe(
         image1, image2,
-        prompt="fortune teller ball",
-        num_inference_steps=25,
-        strength=0.,
-        steps_per_frame=10,
-        guidance_scale=4,
-        negative_prompt="blurry, text, bad anatomy, extra arms, extra fingers, poorly drawn hands, disfigured, tiling, deformed, mutated",
+        prompt = "palm trees on beach, blurry colors, beautiful anime wallpaper, studio ghibli, anime, by hayao miyazaki, anime wallpaper, highly detailed",
+        num_inference_steps=80,
+        steps_per_frame=20,
+        guidance_scale=5,
+        negative_prompt="people, person, text, watermark, watermark, text, writing, signature, photograph, 3d render",
         output_dir=folder,
     )
-
+    
     # import subprocess, glob
     # folder = "./out"
     # cmd = [
