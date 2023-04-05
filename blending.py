@@ -556,23 +556,23 @@ class BlendingPipeline(DiffusionPipeline):
 
 if __name__ == "__main__":
     pipe = BlendingPipeline.from_pretrained(
-        # "runwayml/stable-diffusion-v1-5",
-        "stabilityai/stable-diffusion-2-1",
+        "runwayml/stable-diffusion-v1-5",
+        # "stabilityai/stable-diffusion-2-1",
         torch_dtype=torch.float16,
     ).to("cuda")
     pipe.enable_xformers_memory_efficient_attention()
-
-    image1 = Image.open(expanduser('beach__.png')).convert('RGB').resize((1280,768))
-    image2 = Image.open(expanduser('bed_blur.png')).convert('RGB').resize((1280,768))
+    
+    image1 = Image.open(expanduser('05.png')).convert('RGB').resize((512,512))
+    image2 = Image.open(expanduser('j1.jpeg')).convert('RGB').resize((512,512))
     folder = "./blend"
     shutil.rmtree(folder, ignore_errors=True)
     frame_filepaths = pipe(
         image1, image2,
-        prompt = "palm trees on beach, blurry colors, beautiful anime wallpaper, studio ghibli, anime, by hayao miyazaki, anime wallpaper, highly detailed",
+        prompt = "Disney cartoon, mulan, crisp, smooth, high quality wallpaper",
         num_inference_steps=80,
         steps_per_frame=20,
         guidance_scale=5,
-        negative_prompt="people, person, text, watermark, watermark, text, writing, signature, photograph, 3d render",
+        negative_prompt="watermark, text, writing, signature, photograph, 3d render, jpeg, artifacts, blurry",
         output_dir=folder,
     )
     
