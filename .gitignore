@@ -1,7 +1,5 @@
-# Initially taken from Github's Python gitignore file
 *.png
 scratchpad.ipynb
-scripts/
 dreambooth/
 inst_dir/
 cls_dir/
