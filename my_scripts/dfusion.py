@@ -19,14 +19,13 @@ if __name__ == "__main__":
     pipe = SDSStableDiffusionPipeline.from_pretrained(
         "stabilityai/stable-diffusion-2-1",
         safety_checker=None, torch_dtype=torch.float16).to("cuda")
-    # scheduler = HeunDiscreteScheduler.from_config(pipe.scheduler.config)
-    scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
-    # pipe.scheduler = scheduler
+    # pipe.scheduler = HeunDiscreteScheduler.from_config(pipe.scheduler.config)
+    pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
     pipe.enable_xformers_memory_efficient_attention()
 
     neg_prompt = "low quality, ugly, blurry"
     prompt = {
-        0: "close up photo of a cute dog",
+        0: "photo of a cute dog playing on a lawn",
         # 0: "Escher masterpiece, optical illusion, abstract art, surrealism, impossible",
         1: "beautiful line drawing, abstract art, elegant, simple, minimalist masterpiece",
         2: "minimal flat 2d vector icon. lineal color. on a white background. trending on artstation",
@@ -38,7 +37,8 @@ if __name__ == "__main__":
     os.makedirs(folder, exist_ok=True)
     open(folder+'/prompt.txt', 'w').write(str(prompt[p_ix]))
     for ix in range(1):
-        kwargs = dict(prompt=prompt[p_ix], num_inference_steps=40, guidance_scale=8, negative_prompt=neg_prompt)
+        kwargs = dict(prompt=prompt[p_ix], num_inference_steps=50, num_sds_steps=30,
+                      guidance_scale=7.5, negative_prompt=neg_prompt, lr=1e-3)
         img = pipe.sds(**kwargs).images
         img[0].save(f"{folder}/0_sds.png")
         # img = pipe(**kwargs).images
